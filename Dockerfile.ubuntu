@@ -1,0 +1,156 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends \
+      binutils \
+      ca-certificates \
+      curl; \
+    rm -rf /var/lib/apt/lists/*
+
+# Go comes from go.dev instead of the distro, so that both distros build with
+# the same release and get Go's security fixes when Go publishes them. Update
+# the version and both checksums together, from https://go.dev/dl/.
+# GOTOOLCHAIN=local keeps go from downloading another toolchain: a go-jsonnet
+# release that needs a newer Go fails to build until the pin is raised.
+ARG GO_TOOLCHAIN=go1.26.9
+ARG GO_TOOLCHAIN_AMD64_SHA256=42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d
+ARG GO_TOOLCHAIN_ARM64_SHA256=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      amd64) sha256="${GO_TOOLCHAIN_AMD64_SHA256}" ;; \
+      arm64) sha256="${GO_TOOLCHAIN_ARM64_SHA256}" ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/go.tar.gz \
+      "https://dl.google.com/go/${GO_TOOLCHAIN}.linux-${TARGETARCH}.tar.gz"; \
+    echo "${sha256}  /tmp/go.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/go.tar.gz -C /usr/local; \
+    rm /tmp/go.tar.gz; \
+    test "$(/usr/local/go/bin/go env GOVERSION)" = "${GO_TOOLCHAIN}"
+# Modules come only from the Go module proxy and are checked against go.sum
+# and the checksum database. Without cgo the binaries are static.
+ENV PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GOTOOLCHAIN=local \
+    GOPROXY=https://proxy.golang.org \
+    GOSUMDB=sum.golang.org \
+    CGO_ENABLED=0
+
+# The source tarball is a git archive of the release tag, so its header
+# records the commit. The build log shows it and buildinfo keeps it.
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://github.com/google/go-jsonnet/releases/download/v${VERSION}/go-jsonnet-v${VERSION}.tar.gz"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/go-jsonnet.tar.gz "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/go-jsonnet.tar.gz" | sha256sum -c -; \
+    gzip -dc /tmp/go-jsonnet.tar.gz > /tmp/go-jsonnet.tar; \
+    head -c 1024 /tmp/go-jsonnet.tar | tail -c 512 | tr -d '\000' \
+      | sed -n 's/^[0-9]* comment=\([0-9a-f]\{40\}\)$/\1/p' > /tmp/source-commit; \
+    commit="$(cat /tmp/source-commit)"; \
+    echo "go-jsonnet commit from the tarball header: ${commit:-unknown}"; \
+    mkdir /src; \
+    tar -xf /tmp/go-jsonnet.tar -C /src --strip-components=1; \
+    rm /tmp/go-jsonnet.tar /tmp/go-jsonnet.tar.gz; \
+    echo "$url" > /tmp/source-url; \
+    grep -qx "const version = \"v${VERSION}\"" /src/vm.go \
+      || { echo "vm.go does not declare version v${VERSION}" >&2; exit 1; }
+
+WORKDIR /src
+ARG JOBS
+# Only the four command-line tools are built: cmd/wasm targets browsers and
+# cmd/dumpstdlibast regenerates astgen/stdast.go. That file already holds the
+# standard library, so the cpp-jsonnet submodule, which the tarball leaves
+# empty, is not needed.
+RUN mkdir -p /out/usr/local/bin; \
+    go build -mod=readonly -trimpath -buildvcs=false -p "${JOBS:-$(nproc)}" -ldflags '-s -w' \
+      -o /out/usr/local/bin/ ./cmd/jsonnet ./cmd/jsonnetfmt ./cmd/jsonnet-lint ./cmd/jsonnet-deps; \
+    go mod verify; \
+    printf '%s\n' \
+      "jsonnet Jsonnet commandline interpreter (Go implementation) v${VERSION}" \
+      "jsonnetfmt Jsonnet reformatter v${VERSION}" \
+      "jsonnet-lint Jsonnet linter v${VERSION}" \
+      "jsonnet-deps Jsonnet static dependency parser v${VERSION}" > /tmp/versions; \
+    : > /tmp/version-lines; \
+    while read -r tool expected; do \
+      bin="/out/usr/local/bin/${tool}"; \
+      got="$("$bin" --version)"; \
+      test "$got" = "$expected" || { echo "${tool} --version: expected '${expected}', got '${got}'" >&2; exit 1; }; \
+      echo "$got" >> /tmp/version-lines; \
+      go version -m "$bin" > "/tmp/${tool}.modules"; \
+      awk -F '\t' '$2 == "build" { print $3 }' "/tmp/${tool}.modules" > /tmp/build-settings; \
+      for setting in CGO_ENABLED=0 -trimpath=true; do \
+        grep -Fqx -- "$setting" /tmp/build-settings \
+          || { cat "/tmp/${tool}.modules" >&2; echo "${tool}: missing build setting ${setting}" >&2; exit 1; }; \
+      done; \
+      readelf -lW "$bin" > /tmp/elf; \
+      if grep -Eq '^ +(INTERP|DYNAMIC) ' /tmp/elf; then \
+        cat /tmp/elf >&2; echo "${tool} is not statically linked" >&2; exit 1; \
+      fi; \
+    done < /tmp/versions
+
+ARG BASE_IMAGE
+# go-licenses.sh copies the license files at the root of each Go module linked
+# into a binary, and those of the Go distribution. The loop before it adds the
+# files kept in the directory of a linked package below its module's root,
+# such as those of the go-yaml v2 fork in sigs.k8s.io/yaml/goyaml.v2. The
+# binaries load no libraries, so runtime-deps only has the packages in
+# runtime-deps.ubuntu.
+RUN --mount=type=bind,source=scripts/go-licenses.sh,target=/tmp/go-licenses.sh \
+    --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/jsonnet; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/LICENSE"; \
+    go list -deps -f '{{if .Module}}{{if not .Module.Main}}{{.Module.Path}} {{.Module.Dir}} {{.Dir}}{{end}}{{end}}' \
+      ./cmd/jsonnet ./cmd/jsonnetfmt ./cmd/jsonnet-lint ./cmd/jsonnet-deps | LC_ALL=C sort -u > /tmp/packages; \
+    test -s /tmp/packages; \
+    while read -r mod moddir dir; do \
+      sub="${dir#"$moddir"}"; \
+      if [ -z "$sub" ]; then continue; fi; \
+      for f in "$dir"/*; do \
+        case "${f##*/}" in \
+          [Ll][Ii][Cc][Ee][Nn][CcSs][Ee]* | [Cc][Oo][Pp][Yy][Ii][Nn][Gg]* | \
+          [Nn][Oo][Tt][Ii][Cc][Ee]* | [Pp][Aa][Tt][Ee][Nn][Tt][Ss]*) \
+            if [ -f "$f" ]; then mkdir -p "$meta/licenses/${mod}${sub}"; cp "$f" "$meta/licenses/${mod}${sub}/"; fi ;; \
+        esac; \
+      done; \
+    done < /tmp/packages; \
+    for tool in jsonnet jsonnetfmt jsonnet-lint jsonnet-deps; do \
+      sh /tmp/go-licenses.sh "/out/usr/local/bin/${tool}" "$meta/licenses"; \
+    done; \
+    if find "$meta/licenses" -type f -size 0 | grep .; then echo "empty license file" >&2; exit 1; fi; \
+    echo "${VERSION}" > "$meta/version"; \
+    cp /tmp/source-url "$meta/source"; \
+    commit="$(cat /tmp/source-commit)"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "go: $(go env GOVERSION)"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "commit: ${commit:-unknown}"; \
+      cat /tmp/version-lines; \
+      sed 1d /tmp/jsonnet.modules; \
+    } > "$meta/buildinfo"; \
+    LC_ALL=C sort -u /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/jsonnet/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "jsonnet"]
+CMD ["--help"]
