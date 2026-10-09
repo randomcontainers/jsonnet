@@ -1,0 +1,113 @@
+name: jsonnet
+title: Jsonnet (Go implementation)
+summary: Evaluates, formats and lints Jsonnet with jsonnet, jsonnetfmt, jsonnet-lint and jsonnet-deps from go-jsonnet, the Go implementation.
+homepage: https://jsonnet.org/
+# go-jsonnet (Apache-2.0) and the Go modules linked into it: MIT (color,
+# go-colorable, go-isatty, sigs.k8s.io/yaml), BSD-3-Clause (the Go standard
+# library, golang.org/x/crypto, golang.org/x/sys, and the code sigs.k8s.io/yaml
+# takes from encoding/json) and Apache-2.0 (the go-yaml v2 fork inside
+# sigs.k8s.io/yaml, whose files ported from libyaml are MIT).
+license: Apache-2.0 AND MIT AND BSD-3-Clause
+upstream:
+  source: github-release
+  repository: google/go-jsonnet
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 0.22.0
+  # A git archive of the tag, attached to each release. Upstream's
+  # checksums.txt covers only the prebuilt binaries, so the reconciler pins it
+  # by the digest GitHub records for the asset.
+  artifact:
+    url: https://github.com/google/go-jsonnet/releases/download/v{version}/go-jsonnet-v{version}.tar.gz
+    sha256: aa5950b15fcd6b5add8a6aafb0aaaaee495071742f3abc6825e78aa8f5faa4dc
+image:
+  entrypoint: [jsonnet]
+  cmd: [--help]
+test:
+  - |
+    for tool in jsonnet jsonnetfmt jsonnet-lint jsonnet-deps; do
+      "$tool" --version
+    done > version.txt
+    printf '%s\n' \
+      "Jsonnet commandline interpreter (Go implementation) v$VERSION" \
+      "Jsonnet reformatter v$VERSION" \
+      "Jsonnet linter v$VERSION" \
+      "Jsonnet static dependency parser v$VERSION" > version.want
+    cmp version.want version.txt \
+      || { echo expected: >&2; cat version.want >&2; echo got: >&2; cat version.txt >&2; exit 1; }
+  - |
+    # std.parseYaml goes through sigs.k8s.io/yaml and std.sha3 through
+    # golang.org/x/crypto, the two modules the interpreter links.
+    jsonnet -e '{a: std.parseYaml("k: [1, 2]").k[1], b: std.md5(""), c: std.sha3("")}' > builtins.json
+    got="$(tr -d ' \n' < builtins.json)"
+    want='{"a":2,"b":"d41d8cd98f00b204e9800998ecf8427e","c":"a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26"}'
+    test "$got" = "$want" || { echo "expected $want, got $got" >&2; exit 1; }
+  - |
+    # Libraries are found through -J and through JSONNET_PATH, and not
+    # without either.
+    mkdir -p lib
+    printf '%s\n' "{ name: 'x' }" > lib/x.libsonnet
+    printf '%s\n' "(import 'x.libsonnet').name" > main.jsonnet
+    printf '%s\n' '"x"' > import.want
+    jsonnet -J lib main.jsonnet > import-jpath.txt
+    cmp import.want import-jpath.txt || { cat import-jpath.txt >&2; exit 1; }
+    JSONNET_PATH=lib jsonnet main.jsonnet > import-env.txt
+    cmp import.want import-env.txt || { cat import-env.txt >&2; exit 1; }
+    if jsonnet main.jsonnet > import-none.txt 2>&1; then
+      echo "the import resolved without -J or JSONNET_PATH" >&2; exit 1
+    fi
+  - |
+    # -m writes one file per field and lists them, -y writes a YAML stream,
+    # and top-level arguments and external variables come from flags.
+    printf '%s\n' '{' "  'a.json': 1," "  'b.json': 'two'," '}' > multi.jsonnet
+    jsonnet -c -m out multi.jsonnet > multi.txt
+    printf '%s\n' out/a.json out/b.json > multi.want
+    cmp multi.want multi.txt || { cat multi.txt >&2; exit 1; }
+    printf '%s\n' 1 > a.want
+    printf '%s\n' '"two"' > b.want
+    cmp a.want out/a.json || { cat out/a.json >&2; exit 1; }
+    cmp b.want out/b.json || { cat out/b.json >&2; exit 1; }
+    jsonnet -y -e '[1, "two"]' > stream.txt
+    printf '%s\n' '---' 1 '---' '"two"' '...' > stream.want
+    cmp stream.want stream.txt || { cat stream.txt >&2; exit 1; }
+    jsonnet -S --tla-str who=world --ext-str greeting=hello \
+      -e 'function(who) std.extVar("greeting") + " " + who' > vars.txt
+    printf '%s\n' 'hello world' > vars.want
+    cmp vars.want vars.txt || { cat vars.txt >&2; exit 1; }
+  - |
+    # jsonnetfmt --test exits with 2 while a file needs reformatting, and -i
+    # reformats it without changing what it evaluates to.
+    printf '%s\n' '{"b":1,   "a":[1,2]}' > fmt.jsonnet
+    jsonnet fmt.jsonnet > fmt-before.json
+    if jsonnetfmt --test fmt.jsonnet > fmt.txt 2>&1; then status=0; else status=$?; fi
+    test "$status" -eq 2 || { cat fmt.txt >&2; echo "expected exit status 2, got $status" >&2; exit 1; }
+    jsonnetfmt -i fmt.jsonnet > fmt.txt
+    jsonnetfmt --test fmt.jsonnet > fmt.txt 2>&1 || { cat fmt.jsonnet fmt.txt >&2; exit 1; }
+    jsonnet fmt.jsonnet > fmt-after.json
+    cmp fmt-before.json fmt-after.json || { cat fmt.jsonnet >&2; exit 1; }
+  - |
+    # jsonnet-lint exits with 2 when it finds a problem and with 0 on a clean file.
+    printf '%s\n' 'local x = 1; {}' > unused.jsonnet
+    if jsonnet-lint unused.jsonnet > lint.txt 2>&1; then status=0; else status=$?; fi
+    test "$status" -eq 2 || { cat lint.txt >&2; echo "expected exit status 2, got $status" >&2; exit 1; }
+    grep -q 'Unused variable: x' lint.txt || { cat lint.txt >&2; exit 1; }
+    printf '%s\n' '{ a: 1 }' > clean.jsonnet
+    jsonnet-lint clean.jsonnet > lint.txt 2>&1 || { cat lint.txt >&2; exit 1; }
+  - |
+    # jsonnet-deps prints the canonical path of every file a program imports.
+    mkdir -p deps/lib
+    printf '%s\n' "{ name: 'y' }" > deps/lib/y.libsonnet
+    printf '%s\n' "(import 'y.libsonnet').name" > deps/main.jsonnet
+    jsonnet-deps -J deps/lib deps/main.jsonnet > deps.txt
+    printf '%s\n' "$(pwd -P)/deps/lib/y.libsonnet" > deps.want
+    cmp deps.want deps.txt || { cat deps.txt >&2; exit 1; }
+examples:
+  - title: Evaluate main.jsonnet with the libraries in vendor/ and print the JSON
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/jsonnet -J vendor main.jsonnet
+  - title: Write each field of the result to its own file in out/
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/jsonnet -J vendor -c -m out main.jsonnet
+  - title: Reformat Jsonnet files in place
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint jsonnetfmt ghcr.io/randomcontainers/jsonnet -i main.jsonnet lib.libsonnet
+  - title: Lint a Jsonnet file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint jsonnet-lint ghcr.io/randomcontainers/jsonnet -J vendor main.jsonnet
