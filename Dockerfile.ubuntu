@@ -18,9 +18,9 @@ RUN apt-get update; \
 # the version and both checksums together, from https://go.dev/dl/.
 # GOTOOLCHAIN=local keeps go from downloading another toolchain: a go-jsonnet
 # release that needs a newer Go fails to build until the pin is raised.
-ARG GO_TOOLCHAIN=go1.26.9
-ARG GO_TOOLCHAIN_AMD64_SHA256=42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d
-ARG GO_TOOLCHAIN_ARM64_SHA256=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052
+ARG GO_TOOLCHAIN=go1.27.3
+ARG GO_TOOLCHAIN_AMD64_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
+ARG GO_TOOLCHAIN_ARM64_SHA256=a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
       amd64) sha256="${GO_TOOLCHAIN_AMD64_SHA256}" ;; \
